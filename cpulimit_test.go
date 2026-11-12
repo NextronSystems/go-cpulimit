@@ -10,8 +10,8 @@ import (
 // Run with -race: exercises Wait/AboveLimit/Stop concurrently with the
 // measuring goroutine while the CPU usage crosses the limit in both directions.
 func TestConcurrentUse(t *testing.T) {
-	l := &Limiter{MaxCPUUsage: 0.5, MeasureInterval: time.Millisecond, Measurements: 1, CurrentProcessOnly: true}
-	if err := l.Start(); err != nil {
+	l, err := New(Config{MaxCPUUsage: 0.5, MeasureInterval: time.Millisecond, Measurements: 1, CurrentProcessOnly: true})
+	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -34,4 +34,29 @@ func TestConcurrentUse(t *testing.T) {
 	wg.Wait()
 	l.Stop()
 	l.Wait() // must not block after Stop
+}
+
+func TestSetMaxCPUUsage(t *testing.T) {
+	// A negative limit is always exceeded
+	l, err := New(Config{MaxCPUUsage: -1, MeasureInterval: time.Millisecond, Measurements: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	l.WaitContext(ctx)
+	if !l.AboveLimit() {
+		t.Fatal("expected CPU usage above a limit of -1")
+	}
+	l.SetMaxCPUUsage(101) // can never be exceeded
+	if got := l.MaxCPUUsage(); got != 101 {
+		t.Fatalf("MaxCPUUsage() = %v, want 101", got)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	l.WaitContext(ctx)
+	if l.AboveLimit() {
+		t.Fatal("expected CPU usage below a limit of 101")
+	}
 }
