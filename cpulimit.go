@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -33,14 +34,14 @@ type Limiter struct {
 	// should be measured; otherwise, the full CPU usage is measured.
 	CurrentProcessOnly bool
 
-	stop bool
+	stop atomic.Bool
 	wg   *sync.WaitGroup
 	self *process.Process
 
 	// waitForBelowLimit will be blocking while the CPU usage is above MaxCPUUsage,
 	// and will be closed when the CPU usage is below MaxCPUUsage.
-	waitForBelowLimit   chan struct{}
-	currentlyBelowLimit bool // Indicates if the CPU usage is currently below the limit
+	waitForBelowLimit   atomic.Pointer[chan struct{}]
+	currentlyBelowLimit atomic.Bool // Indicates if the CPU usage is currently below the limit
 }
 
 // Start starts the CPU limiter. If there are undefined variables
@@ -57,7 +58,8 @@ func (l *Limiter) Start() error {
 	}
 	l.wg = &sync.WaitGroup{}
 	l.wg.Add(1)
-	l.waitForBelowLimit = make(chan struct{})
+	l.stop.Store(false)
+	l.newWaitChannel()
 	if l.CurrentProcessOnly {
 		var err error
 		l.self, err = process.NewProcess(int32(os.Getpid()))
@@ -71,7 +73,7 @@ func (l *Limiter) Start() error {
 
 // Stop stops the limiter. After this stop, Wait() won't block anymore.
 func (l *Limiter) Stop() {
-	l.stop = true
+	l.stop.Store(true)
 	l.wg.Wait()
 }
 
@@ -81,7 +83,7 @@ func (l *Limiter) Wait() {
 }
 
 func (l *Limiter) WaitContext(ctx context.Context) {
-	if l.currentlyBelowLimit {
+	if l.currentlyBelowLimit.Load() {
 		// If the CPU usage is already below the limit, we can return immediately
 		return
 	}
@@ -92,14 +94,25 @@ func (l *Limiter) WaitContext(ctx context.Context) {
 	// Otherwise, we wait for the CPU usage to go below the limit
 	// or the context to be done
 	select {
-	case <-l.waitForBelowLimit:
+	case <-l.waitChannel():
 	case <-ctx.Done():
 	}
 }
 
+// waitChannel returns the current waitForBelowLimit channel.
+// It must not be called before Start().
+func (l *Limiter) waitChannel() chan struct{} {
+	return *l.waitForBelowLimit.Load()
+}
+
+func (l *Limiter) newWaitChannel() {
+	ch := make(chan struct{})
+	l.waitForBelowLimit.Store(&ch)
+}
+
 // AboveLimit reports if the CPU usage is above MaxCPUUsage
 func (l *Limiter) AboveLimit() bool {
-	return !l.currentlyBelowLimit
+	return !l.currentlyBelowLimit.Load()
 }
 
 func (l *Limiter) run() {
@@ -114,8 +127,8 @@ func (l *Limiter) run() {
 	)
 	defer func() {
 		// Close the channel if it was blocking, so that Wait() can return
-		if !l.currentlyBelowLimit {
-			close(l.waitForBelowLimit)
+		if !l.currentlyBelowLimit.Load() {
+			close(l.waitChannel())
 		}
 	}()
 	tk := time.NewTicker(l.MeasureInterval)
@@ -123,7 +136,7 @@ func (l *Limiter) run() {
 	busy2, all2 = l.getBusy()
 	var counter int
 	for range tk.C {
-		if l.stop {
+		if l.stop.Load() {
 			break
 		}
 		busy1, all1 = busy2, all2
@@ -131,16 +144,16 @@ func (l *Limiter) run() {
 		cpuUsage = getCPUUsage(busy1, all1, busy2, all2)
 		m[counter] = cpuUsage
 		if average(m) > l.MaxCPUUsage {
-			if l.currentlyBelowLimit {
+			if l.currentlyBelowLimit.Load() {
 				// Create a new, blocking channel to signal that the CPU usage is above the limit
-				l.waitForBelowLimit = make(chan struct{})
-				l.currentlyBelowLimit = false
+				l.newWaitChannel()
+				l.currentlyBelowLimit.Store(false)
 			}
 		} else {
-			if !l.currentlyBelowLimit {
+			if !l.currentlyBelowLimit.Load() {
 				// Close the channel to signal that the CPU usage is below the limit
-				close(l.waitForBelowLimit)
-				l.currentlyBelowLimit = true
+				close(l.waitChannel())
+				l.currentlyBelowLimit.Store(true)
 			}
 		}
 		counter++

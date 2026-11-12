@@ -3,7 +3,7 @@ package main
 import (
 	"time"
 
-	"github.com/Codehardt/go-cpulimit"
+	"github.com/NextronSystems/go-cpulimit"
 )
 
 func main() {
