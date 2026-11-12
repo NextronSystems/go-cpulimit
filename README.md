@@ -15,15 +15,18 @@ This package requires [github.com/shirou/gopsutil](https://github.com/shirou/gop
 ## Example
 
 ```golang
-limiter := &cpulimit.Limiter{
+limiter, err := cpulimit.New(cpulimit.Config{
     MaxCPUUsage:     50.0,                   // throttle CPU usage to 50%
     MeasureInterval: time.Millisecond * 333, // measure cpu usage in an interval of 333 ms
     Measurements:    3,                      // use the avg of the last 3 measurements
+})
+if err != nil {
+    panic(err)
 }
-limiter.Start()
 defer limiter.Stop()
+limiter.SetMaxCPUUsage(30.0) // the limit can be adjusted while the limiter runs
 for {
-    limiter.Wait() // wait until cpu usage is below 50%
+    limiter.Wait() // wait until cpu usage is below the limit
     /*
      * do some work
      */
