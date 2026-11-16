@@ -2,6 +2,7 @@ package cpulimit
 
 import (
 	"context"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -20,8 +21,8 @@ const (
 	DefaultMeasurements int = 3
 )
 
-// Limiter limits the CPU usage
-type Limiter struct {
+// Config configures a Limiter. Zero values are replaced by the defaults.
+type Config struct {
 	// MaxCPUUsage specifies the maximum CPU usage; wait will block if the
 	// average CPU usage during the previous measurements exceeds this value.
 	MaxCPUUsage float64
@@ -33,9 +34,17 @@ type Limiter struct {
 	// CurrentProcessOnly specifies that only the CPU usage of the current process
 	// should be measured; otherwise, the full CPU usage is measured.
 	CurrentProcessOnly bool
+}
+
+// Limiter limits the CPU usage. Create one with New.
+type Limiter struct {
+	cfg Config
+	// maxCPUUsage holds the float64 bits of the current limit; it is adjustable
+	// while the limiter runs, see SetMaxCPUUsage.
+	maxCPUUsage atomic.Uint64
 
 	stop atomic.Bool
-	wg   *sync.WaitGroup
+	wg   sync.WaitGroup
 	self *process.Process
 
 	// waitForBelowLimit will be blocking while the CPU usage is above MaxCPUUsage,
@@ -44,37 +53,49 @@ type Limiter struct {
 	currentlyBelowLimit atomic.Bool // Indicates if the CPU usage is currently below the limit
 }
 
-// Start starts the CPU limiter. If there are undefined variables
-// Start() will set them to the default values.
-func (l *Limiter) Start() error {
-	if l.MaxCPUUsage == 0.0 {
-		l.MaxCPUUsage = DefaultLimit
+// New creates a CPU limiter and starts measuring the CPU usage.
+// Call Stop to release it.
+func New(cfg Config) (*Limiter, error) {
+	if cfg.MaxCPUUsage == 0.0 {
+		cfg.MaxCPUUsage = DefaultLimit
 	}
-	if l.MeasureInterval == 0 {
-		l.MeasureInterval = DefaultInterval
+	if cfg.MeasureInterval == 0 {
+		cfg.MeasureInterval = DefaultInterval
 	}
-	if l.Measurements == 0 {
-		l.Measurements = DefaultMeasurements
+	if cfg.Measurements == 0 {
+		cfg.Measurements = DefaultMeasurements
 	}
-	l.wg = &sync.WaitGroup{}
-	l.wg.Add(1)
-	l.stop.Store(false)
-	l.newWaitChannel()
-	if l.CurrentProcessOnly {
+	l := &Limiter{cfg: cfg}
+	l.SetMaxCPUUsage(cfg.MaxCPUUsage)
+	if cfg.CurrentProcessOnly {
 		var err error
 		l.self, err = process.NewProcess(int32(os.Getpid()))
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
+	l.newWaitChannel()
+	l.wg.Add(1)
 	go l.run()
-	return nil
+	return l, nil
 }
 
 // Stop stops the limiter. After this stop, Wait() won't block anymore.
 func (l *Limiter) Stop() {
 	l.stop.Store(true)
 	l.wg.Wait()
+}
+
+// MaxCPUUsage returns the current maximum CPU usage.
+func (l *Limiter) MaxCPUUsage() float64 {
+	return math.Float64frombits(l.maxCPUUsage.Load())
+}
+
+// SetMaxCPUUsage changes the maximum CPU usage. It is safe to call concurrently
+// with all other methods and takes effect with the next measurement.
+// Unlike in Config, a zero value is not replaced by the default.
+func (l *Limiter) SetMaxCPUUsage(limit float64) {
+	l.maxCPUUsage.Store(math.Float64bits(limit))
 }
 
 // Wait waits until the CPU usage is below MaxCPUUsage
@@ -100,7 +121,6 @@ func (l *Limiter) WaitContext(ctx context.Context) {
 }
 
 // waitChannel returns the current waitForBelowLimit channel.
-// It must not be called before Start().
 func (l *Limiter) waitChannel() chan struct{} {
 	return *l.waitForBelowLimit.Load()
 }
@@ -123,7 +143,7 @@ func (l *Limiter) run() {
 		all1     float64
 		all2     float64
 		cpuUsage float64
-		m        = make([]float64, l.Measurements) // measurements
+		m        = make([]float64, l.cfg.Measurements) // measurements
 	)
 	defer func() {
 		// Close the channel if it was blocking, so that Wait() can return
@@ -131,7 +151,7 @@ func (l *Limiter) run() {
 			close(l.waitChannel())
 		}
 	}()
-	tk := time.NewTicker(l.MeasureInterval)
+	tk := time.NewTicker(l.cfg.MeasureInterval)
 	defer tk.Stop()
 	busy2, all2 = l.getBusy()
 	var counter int
@@ -143,7 +163,7 @@ func (l *Limiter) run() {
 		busy2, all2 = l.getBusy()
 		cpuUsage = getCPUUsage(busy1, all1, busy2, all2)
 		m[counter] = cpuUsage
-		if average(m) > l.MaxCPUUsage {
+		if average(m) > l.MaxCPUUsage() {
 			if l.currentlyBelowLimit.Load() {
 				// Create a new, blocking channel to signal that the CPU usage is above the limit
 				l.newWaitChannel()
@@ -157,7 +177,7 @@ func (l *Limiter) run() {
 			}
 		}
 		counter++
-		if counter > l.Measurements-1 {
+		if counter > l.cfg.Measurements-1 {
 			counter = 0
 		}
 	}
@@ -172,7 +192,7 @@ func average(m []float64) (avg float64) {
 }
 
 func (l *Limiter) getBusy() (busy, all float64) {
-	if l.CurrentProcessOnly {
+	if l.cfg.CurrentProcessOnly {
 		busy, _ = busyFromTimes(getProcessCpuTimes(l.self))
 		_, all = busyFromTimes(getGlobalCpuTimes())
 	} else {
